@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"runtime"
@@ -19,6 +20,11 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
+
+type Packet struct {
+	Endpoint Endpoint
+	Data     []byte
+}
 
 var (
 	_ Bind = (*StdNetBind)(nil)
@@ -46,9 +52,16 @@ type StdNetBind struct {
 
 	blackhole4 bool
 	blackhole6 bool
+
+	filter func([]byte) bool
+	queue  chan *Packet
 }
 
-func NewStdNetBind() Bind {
+func NewStdNetBind(filter ...func([]byte) bool) Bind {
+	fn := func(b []byte) bool { return false }
+	if len(filter) > 0 {
+		fn = filter[0]
+	}
 	return &StdNetBind{
 		udpAddrPool: sync.Pool{
 			New: func() any {
@@ -70,6 +83,7 @@ func NewStdNetBind() Bind {
 				return &msgs
 			},
 		},
+		filter: fn,
 	}
 }
 
@@ -140,6 +154,8 @@ func listenNet(network string, port int) (*net.UDPConn, int, error) {
 func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	s.queue = make(chan *Packet)
 
 	var err error
 	var tries int
@@ -263,18 +279,26 @@ func (s *StdNetBind) receiveIP(
 		}
 		numMsgs = 1
 	}
+	var out int
 	for i := 0; i < numMsgs; i++ {
 		msg := &(*msgs)[i]
-		sizes[i] = msg.N
-		if sizes[i] == 0 {
+		n := msg.N
+		if n == 0 {
 			continue
 		}
 		addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
 		ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
 		getSrcFromControl(msg.OOB[:msg.NN], ep)
-		eps[i] = ep
+		if !s.filter(msg.Buffers[0][:n]) {
+			bufs[out] = msg.Buffers[0]
+			sizes[out] = n
+			eps[out] = ep
+			out++
+		} else {
+			s.enqueue(msg.Buffers[0][:n], ep)
+		}
 	}
-	return numMsgs, nil
+	return out, nil
 }
 
 func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
@@ -286,6 +310,25 @@ func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxO
 func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
+	}
+}
+
+func (s *StdNetBind) enqueue(buf []byte, ep Endpoint) {
+	select {
+	case s.queue <- &Packet{Endpoint: ep, Data: buf}:
+	default:
+	}
+}
+
+func (s *StdNetBind) Receive(ctx context.Context) (buf []byte, ep Endpoint, err error) {
+	select {
+	case p, ok := <-s.queue:
+		if !ok {
+			return nil, nil, io.EOF
+		}
+		return p.Data, p.Endpoint, nil
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
 	}
 }
 
@@ -301,6 +344,14 @@ func (s *StdNetBind) BatchSize() int {
 func (s *StdNetBind) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.queue != nil {
+		select {
+		case <-s.queue:
+		default:
+			close(s.queue)
+		}
+	}
 
 	var err1, err2 error
 	if s.ipv4 != nil {
